@@ -2,19 +2,24 @@
 from __future__ import print_function #needs to be at the top
 
 from collections import OrderedDict
+from datetime import datetime
+from time import sleep
+
 import xmltodict
 import requests
 import json
 import warnings
 
+
 __author__ = 'Kaitlin Devine'
 __email__ = 'katycorp@gmail.com'
-__version__ = '0.1.0'
+__version__ = '1.1.0'
+
 
 warnings.filterwarnings('ignore')
 
-field_map = {
-    
+
+field_map = {    
     'piid': 'PIID',
     'idv_piid': 'REF_IDV_PIID',
     'idv_agency_id': 'REF_IDV_AGENCY_ID',
@@ -75,8 +80,8 @@ field_map = {
     'vendor_state_code': 'VENDOR_ADDRESS_STATE_CODE',
     'vendor_state_name': 'VENDOR_ADDRESS_STATE_NAME',
     'vendor_zip': 'VENDOR_ADDRESS_ZIP_CODE',
-
 }
+
 
 boolean_map = {
     True: 'Y',
@@ -87,9 +92,8 @@ boolean_map = {
 class Contracts():
     
     feed_url = "https://www.fpds.gov/ezsearch/FEEDS/ATOM?FEEDNAME=PUBLIC&q="
-    feed_size = 10
-    query_url = ''
-   
+    
+        
     def __init__(self, logger=None):
         #point logger to a log function, print by default
         if logger:
@@ -97,19 +101,25 @@ class Contracts():
         else:
             self.log = print
 
+
     def pretty_print(self, data):
         self.log(json.dumps(data, indent=4))
 
+    
+    def date_format(self, date1, date2):
+        return "[{0},{1}]".format(date1.strftime("%Y/%m/%d"), date2.strftime("%Y/%m/%d"))
+
 
     def convert_params(self, params):
-
         new_params = {}
         for k,v in params.items():
             new_params[field_map[k]] = v
         return new_params
 
+
     def combine_params(self, params):
         return " ".join("%s:%s" % (k,v) for k,v in params.items())
+
 
     def process_data(self, data):
         #todo
@@ -118,41 +128,133 @@ class Contracts():
             data = [data,]
         return data
 
-    def get(self, num_records=100, order='desc', **kwargs):
 
-        params = self.combine_params(self.convert_params(kwargs))
+    def get_setting(self, kwargs, key, default=None):
+        key = "_{}".format(key) #ensure settings start with an underscore
+        
+        try:
+            value = kwargs[key]
+            del kwargs[key] #remove setting from original keyword arguments
+        
+        except KeyError:
+            value = default
+        
+        return value
 
-        data = []
-        i = 0
-        #for n in range(0, num_records, 10):
-        while num_records == "all" or i < num_records:
+
+    def get_last_modified_date(self, entry):
+        try:
+            if 'IDV' in entry:
+                award = entry['IDV']
+            else:
+                award = entry['award']
+         
+            transaction = award['transactionInformation']
+        
+            if 'lastModifiedDate' in transaction:
+                date_string = transaction['lastModifiedDate']
+            else:
+                date_string = transaction['createdDate']
             
-            self.log("querying {0}{1}&start={2}".format(self.feed_url, params, i))
-            resp = requests.get(self.feed_url + params + '&start={0}'.format(i), timeout=60, verify = False)
-            self.query_url = resp.url
-            self.log("finished querying {0}".format(resp.url))
-            resp_data = xmltodict.parse(resp.text, process_namespaces=True, namespaces={'http://www.fpdsng.com/FPDS': None, 'http://www.w3.org/2005/Atom': None})
-            try:
-                processed_data = self.process_data(resp_data['feed']['entry'])
+            return datetime.strptime(date_string, "%Y-%m-%d %H:%M:%S")
+        
+        except Exception as e:
+            return None
+    
+    
+    def get_api_results(self, params, start_index=1):
+        self.log("querying {0}{1}&start={2}".format(self.feed_url, params, start_index))        
+        
+        resp = requests.get(self.feed_url + params + '&start={0}'.format(start_index), timeout=60, verify = False)
+        resp_data = xmltodict.parse(resp.text, process_namespaces=True, namespaces={'http://www.fpdsng.com/FPDS': None, 'http://www.w3.org/2005/Atom': None})        
+        
+        self.log("finished querying {0}".format(resp.url))
+        try:
+            processed_data = self.process_data(resp_data['feed']['entry'])
+
+        except KeyError as e:
+            return None
+        
+        return processed_data
+
+
+    def get(self, num_records=100, **kwargs):
+        data = []
+        
+        #TODO: do something with order
+        #for now remove slently if specified
+        if 'order' in kwargs:
+            del kwargs['order']
+            
+        sleep_secs = int(self.get_setting(kwargs, 'sleep', 0))
+        data_count = int(self.get_setting(kwargs, 'count', 0))
+        index = int(self.get_setting(kwargs, 'index', 0))
+        return_page = self.get_setting(kwargs, 'return_page', False)
+        
+        #For some reason FPDS-NG is returning last modified records outside of requested range
+        #which can blow up the system (memory usage issues), so check for proper modified timestamp
+        #or none in the FPDS data before adding to final product.  This should free up some space.
+        if 'last_modified_date' in kwargs and isinstance(kwargs['last_modified_date'], list):
+            first_date = kwargs['last_modified_date'][0]
+            last_date = kwargs['last_modified_date'][1]
+            kwargs['last_modified_date'] = self.date_format(first_date, last_date)
+        else:
+            first_date = None
+            last_date = None
+        
+        params = self.combine_params(self.convert_params(kwargs))
+        
+        while num_records == "all" or index < num_records:
+            if sleep_secs > 0: 
+                sleep(sleep_secs)
+            
+            processed_data = self.get_api_results(params, index)
+             
+            if processed_data is not None:
                 for pd in processed_data:
+                    index += 1
+                    
+                    pd['modified'] = self.get_last_modified_date(pd['content'])
+                     
+                    #This code is the makeshift attempt to correct for a possible bug in the
+                    #FPDS-NG ATOM feed api date range selector that returns results outside
+                    #the last updated range requested (often by many years)
+                    #
+                    #This intentionally has no effect if string modification date format is used
+                    #
+                    if pd['modified']:
+                        if first_date and pd['modified'].date() < first_date:
+                            continue
+                        if last_date and pd['modified'].date() > last_date:
+                            continue
+                    
                     data.append(pd)
-                    i += 1
                 
                 #if data contains less than 10 records, break out of loop
-                if  len(processed_data) < 10:
+                if len(processed_data) < 10:
+                    index = 0 #use index as a check if we have reached the last page
                     break
-            
-            except KeyError as e:
+                
+                #if we specify a maximum data count and we have reached it, exit with what we have
+                if data_count > 0 and len(data) >= data_count:
+                    break           
+            else:
                 #no results
                 self.log("No results for query")
-                break
-
+                index = 0
+                break       
+        
+        #need to contextually return a list based on if we are retrieving a page
+        if return_page:
+            return data, index
+        
         return data
 
 
-
-
-
-
-
-
+    def get_page(self, index=0, count=0, **kwargs):
+        kwargs['_index'] = index
+        kwargs['_count'] = count
+        kwargs['_return_page'] = True
+        
+        data, index = self.get('all', **kwargs)
+        return data, index
