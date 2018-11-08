@@ -166,7 +166,7 @@ class Contracts():
         self.log("querying {0}{1}&start={2}".format(self.feed_url, params, start_index))        
         
         resp = requests.get(self.feed_url + params + '&start={0}'.format(start_index), timeout=60, verify = False)
-        resp_data = xmltodict.parse(resp.text, process_namespaces=True, namespaces={'http://www.fpdsng.com/FPDS': None, 'http://www.w3.org/2005/Atom': None})        
+        resp_data = xmltodict.parse(resp.text, process_namespaces=True, namespaces={'https://www.fpds.gov/FPDS': None, 'http://www.w3.org/2005/Atom': None})        
         
         self.log("finished querying {0}".format(resp.url))
         try:
